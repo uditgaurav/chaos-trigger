@@ -2,6 +2,15 @@ name: Harness Chaos Trigger With APIs
 on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      input_set_identity:
+        description: "Input set identifier"
+        required: true
+        default: "Boutique_App_Resilience_Test_Inputs"
+      expected_resilience_score:
+        description: "Expected resilience score (0-100)"
+        required: true
+        default: "50"
 
 jobs:
   harness-chaos:
@@ -11,19 +20,48 @@ jobs:
       ORG_ID: ${{ vars.HARNESS_ORG_ID }}
       PROJECT_ID: ${{ vars.HARNESS_PROJECT_ID }}
       EXPERIMENT_ID: ${{ vars.HARNESS_EXPERIMENT_ID }}
-      INPUT_SET_IDENTITY: ${{ vars.HARNESS_INPUT_SET_IDENTITY || 'Boutique_App_Resilience_Test_Inputs' }}
-      EXPECTED_RES_SCORE: ${{ vars.HARNESS_EXPECTED_RES_SCORE }}
+      INPUT_SET_IDENTITY: ${{ inputs.input_set_identity }}
+      EXPECTED_RES_SCORE: ${{ inputs.expected_resilience_score }}
       API_KEY: ${{ secrets.HARNESS_API_KEY }}
       BASE_URL: https://app.harness.io
-      TIMEOUT: "300"
+      TIMEOUT: "600"
       DELAY: "2"
     steps:
       - name: Trigger Harness Chaos Experiment and monitor
         run: |
           set -euo pipefail
 
+          MISSING=""
+          for v in ACCOUNT_ID ORG_ID PROJECT_ID EXPERIMENT_ID API_KEY; do
+            if [ -z "${!v:-}" ]; then MISSING="$MISSING $v"; fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "❌ Missing required env vars/secrets:$MISSING"
+            echo "Set HARNESS_ACCOUNT_ID, HARNESS_ORG_ID, HARNESS_PROJECT_ID, HARNESS_EXPERIMENT_ID as repo Variables"
+            echo "and HARNESS_API_KEY as a repo Secret."
+            exit 1
+          fi
+
+          API_KEY=$(printf '%s' "$API_KEY" | tr -d '\r\n[:space:]')
+          echo "ℹ️  Account: $ACCOUNT_ID  Org: $ORG_ID  Project: $PROJECT_ID  Experiment: $EXPERIMENT_ID"
+
+          AUTH_CHECK_URL="$BASE_URL/gateway/chaos/manager/api/rest/v2/experiments/$EXPERIMENT_ID/variables?accountIdentifier=$ACCOUNT_ID&organizationIdentifier=$ORG_ID&projectIdentifier=$PROJECT_ID&isIdentity=false&routingId=$ACCOUNT_ID"
+          AUTH_CHECK_FILE=$(mktemp)
+          AUTH_CHECK_CODE=$(curl -sS -o "$AUTH_CHECK_FILE" -w "%{http_code}" \
+            "$AUTH_CHECK_URL" \
+            -H "x-api-key: $API_KEY" \
+            -H "Accept: application/json" || echo "000")
+          AUTH_CHECK_BODY=$(cat "$AUTH_CHECK_FILE"); rm -f "$AUTH_CHECK_FILE"
+          echo "ℹ️  Auth check (GET /variables): HTTP $AUTH_CHECK_CODE"
+          if [ "$AUTH_CHECK_CODE" = "401" ] || [ "$AUTH_CHECK_CODE" = "403" ]; then
+            echo "❌ Auth check failed. The x-api-key is not accepted by the gateway."
+            echo "Body (first 500 chars): $(printf '%s' "$AUTH_CHECK_BODY" | head -c 500)"
+            echo "Fixes: regenerate a Harness PAT with Chaos > Execute Experiment + View permission scoped to project $PROJECT_ID, paste it into the HARNESS_API_KEY repo Secret with no trailing newline."
+            exit 1
+          fi
+
           API="$BASE_URL/gateway/chaos/manager/api/rest/v2/experiments/$EXPERIMENT_ID/run"
-          QS="accountIdentifier=$ACCOUNT_ID&organizationIdentifier=$ORG_ID&projectIdentifier=$PROJECT_ID"
+          QS="accountIdentifier=$ACCOUNT_ID&organizationIdentifier=$ORG_ID&projectIdentifier=$PROJECT_ID&routingId=$ACCOUNT_ID"
 
           PAYLOAD=$(jq -n --arg identity "$INPUT_SET_IDENTITY" \
             '{inputsetIdentity: $identity, runtimeInputs: null}')
@@ -32,6 +70,7 @@ jobs:
           HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w "%{http_code}" \
             -X POST "$API?$QS&isOnboardingRun=false&isIdentity=false" \
             -H "x-api-key: $API_KEY" \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" || echo "000")
           RUN_RESP=$(cat "$RESP_FILE")
@@ -61,7 +100,9 @@ jobs:
           while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
             POLL_FILE=$(mktemp)
             POLL_CODE=$(curl -sS -o "$POLL_FILE" -w "%{http_code}" \
-              "$API?$QS&notifyId=$NOTIFY_ID" -H "x-api-key: $API_KEY" || echo "000")
+              "$API?$QS&notifyId=$NOTIFY_ID" \
+              -H "x-api-key: $API_KEY" \
+              -H "Accept: application/json" || echo "000")
             RUN_GET=$(cat "$POLL_FILE")
             rm -f "$POLL_FILE"
 

@@ -1,0 +1,81 @@
+name: Harness Chaos Abort
+on:
+  # Allows you to abort a chaos experiment run manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      notify_id:
+        description: "Notify ID of the experiment run to abort (printed by the trigger pipelines)"
+        required: true
+      force_stop:
+        description: "Force stop the experiment run"
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  harness-chaos-abort:
+    runs-on: ubuntu-latest
+    env:
+      ACCOUNT_ID: ${{ vars.HARNESS_ACCOUNT_ID }}
+      ORG_ID: ${{ vars.HARNESS_ORG_ID }}
+      PROJECT_ID: ${{ vars.HARNESS_PROJECT_ID }}
+      EXPERIMENT_ID: ${{ vars.HARNESS_EXPERIMENT_ID }}
+      API_KEY: ${{ secrets.HARNESS_API_KEY }}
+      BASE_URL: https://app.harness.io
+      NOTIFY_ID: ${{ inputs.notify_id }}
+      FORCE_STOP: ${{ inputs.force_stop }}
+    steps:
+      - name: Abort Harness Chaos Experiment
+        run: |
+          set -euo pipefail
+
+          MISSING=""
+          for v in ACCOUNT_ID ORG_ID PROJECT_ID EXPERIMENT_ID API_KEY NOTIFY_ID; do
+            if [ -z "${!v:-}" ]; then MISSING="$MISSING $v"; fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "❌ Missing required env vars/secrets/inputs:$MISSING"
+            exit 1
+          fi
+
+          API_KEY=$(printf '%s' "$API_KEY" | tr -d '\r\n[:space:]')
+          echo "ℹ️  Account: $ACCOUNT_ID  Org: $ORG_ID  Project: $PROJECT_ID  Experiment: $EXPERIMENT_ID"
+          echo "ℹ️  notifyID: $NOTIFY_ID  force: $FORCE_STOP"
+
+          STOP_URL="$BASE_URL/gateway/chaos/manager/api/rest/v2/experiment/$EXPERIMENT_ID/stop"
+          QS="accountIdentifier=$ACCOUNT_ID&organizationIdentifier=$ORG_ID&projectIdentifier=$PROJECT_ID&routingId=$ACCOUNT_ID&notifyId=$NOTIFY_ID&force=$FORCE_STOP"
+
+          RESP_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w "%{http_code}" \
+            -X POST "$STOP_URL?$QS" \
+            -H "x-api-key: $API_KEY" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" || echo "000")
+          STOP_RESP=$(cat "$RESP_FILE"); rm -f "$RESP_FILE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Failed to abort experiment (HTTP $HTTP_CODE)."
+            echo "Response body:"
+            echo "$STOP_RESP"
+            exit 1
+          fi
+
+          if echo "$STOP_RESP" | jq -e . >/dev/null 2>&1; then
+            IS_STOPPED=$(echo "$STOP_RESP" | jq -r '.isStopped // empty')
+            EXP_NAME=$(echo "$STOP_RESP" | jq -r '.experimentName // empty')
+            EXP_ID_RESP=$(echo "$STOP_RESP" | jq -r '.experimentId // empty')
+            if [ "$IS_STOPPED" = "true" ]; then
+              echo "🛑 Experiment aborted successfully 🎉"
+              echo "experimentName: ${EXP_NAME:-N/A}"
+              echo "experimentId:   ${EXP_ID_RESP:-N/A}"
+              echo "notifyID:       $NOTIFY_ID"
+            else
+              echo "⚠️  Stop API returned isStopped=$IS_STOPPED. Body:"
+              echo "$STOP_RESP"
+              exit 1
+            fi
+          else
+            echo "⚠️  Non-JSON response from stop API:"
+            echo "$STOP_RESP"
+            exit 1
+          fi
