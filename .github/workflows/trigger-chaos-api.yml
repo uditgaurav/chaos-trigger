@@ -1,0 +1,119 @@
+name: Harness Chaos Trigger With APIs
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  harness-chaos:
+    runs-on: ubuntu-latest
+    env:
+      ACCOUNT_ID: ${{ vars.HARNESS_ACCOUNT_ID }}
+      ORG_ID: ${{ vars.HARNESS_ORG_ID }}
+      PROJECT_ID: ${{ vars.HARNESS_PROJECT_ID }}
+      EXPERIMENT_ID: ${{ vars.HARNESS_EXPERIMENT_ID }}
+      INPUT_SET_IDENTITY: ${{ vars.HARNESS_INPUT_SET_IDENTITY || 'Boutique_App_Resilience_Test_Inputs' }}
+      EXPECTED_RES_SCORE: ${{ vars.HARNESS_EXPECTED_RES_SCORE }}
+      API_KEY: ${{ secrets.HARNESS_API_KEY }}
+      BASE_URL: https://app.harness.io
+      TIMEOUT: "300"
+      DELAY: "2"
+    steps:
+      - name: Trigger Harness Chaos Experiment and monitor
+        run: |
+          set -euo pipefail
+
+          API="$BASE_URL/gateway/chaos/manager/api/rest/v2/experiments/$EXPERIMENT_ID/run"
+          QS="accountIdentifier=$ACCOUNT_ID&organizationIdentifier=$ORG_ID&projectIdentifier=$PROJECT_ID"
+
+          PAYLOAD=$(jq -n --arg identity "$INPUT_SET_IDENTITY" \
+            '{inputsetIdentity: $identity, runtimeInputs: null}')
+
+          RESP_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w "%{http_code}" \
+            -X POST "$API?$QS&isOnboardingRun=false&isIdentity=false" \
+            -H "x-api-key: $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" || echo "000")
+          RUN_RESP=$(cat "$RESP_FILE")
+          rm -f "$RESP_FILE"
+
+          if [ "$HTTP_CODE" != "200" ] || ! echo "$RUN_RESP" | jq -e . >/dev/null 2>&1; then
+            echo "❌ Failed to trigger experiment (HTTP $HTTP_CODE)."
+            echo "Response body:"
+            echo "$RUN_RESP"
+            exit 1
+          fi
+
+          NOTIFY_ID=$(echo "$RUN_RESP" | jq -r '.notifyId // .notifyID // empty')
+          if [ -z "$NOTIFY_ID" ]; then
+            echo "❌ No notifyId in response. Body:"
+            echo "$RUN_RESP"
+            exit 1
+          fi
+
+          echo "🚀 experiment ran successfully, notifyID: $NOTIFY_ID 🎉"
+          echo "The timeout: $TIMEOUT and delay: $DELAY"
+          echo
+
+          ELAPSED=0
+          PHASE=""
+          SCORE=""
+          while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+            POLL_FILE=$(mktemp)
+            POLL_CODE=$(curl -sS -o "$POLL_FILE" -w "%{http_code}" \
+              "$API?$QS&notifyId=$NOTIFY_ID" -H "x-api-key: $API_KEY" || echo "000")
+            RUN_GET=$(cat "$POLL_FILE")
+            rm -f "$POLL_FILE"
+
+            if [ "$POLL_CODE" != "200" ] || ! echo "$RUN_GET" | jq -e . >/dev/null 2>&1; then
+              echo "Waiting for experiment completion... transient poll error (HTTP $POLL_CODE)"
+              sleep "$DELAY"
+              ELAPSED=$((ELAPSED + DELAY))
+              continue
+            fi
+
+            PHASE=$(echo "$RUN_GET" | jq -r '.phase // empty')
+            SCORE=$(echo "$RUN_GET" | jq -r '.resiliencyScore // empty')
+
+            case "$PHASE" in
+              Completed|Completed_With_Error|Completed_With_Probe_Failure|Stopped|Error|Timeout)
+                echo "🚀 Experiment completed, CurrentState: $PHASE 🎉"
+                break
+                ;;
+              "")
+                echo "Waiting for experiment completion... CurrentState: Pending"
+                ;;
+              *)
+                echo "Waiting for experiment completion... CurrentState: $PHASE"
+                ;;
+            esac
+
+            sleep "$DELAY"
+            ELAPSED=$((ELAPSED + DELAY))
+          done
+
+          case "$PHASE" in
+            Completed|Completed_With_Error|Completed_With_Probe_Failure|Stopped|Error|Timeout) ;;
+            *)
+              echo "❌ Timed out after ${TIMEOUT}s waiting for experiment to complete (last state: ${PHASE:-Unknown})"
+              exit 1
+              ;;
+          esac
+
+          echo "The timeout: $TIMEOUT and delay: $DELAY"
+          if [ -n "$SCORE" ] && [ "$SCORE" != "null" ]; then
+            if [ -n "${EXPECTED_RES_SCORE:-}" ]; then
+              if awk -v a="$SCORE" -v b="$EXPECTED_RES_SCORE" 'BEGIN { exit !(a >= b) }'; then
+                echo "🚀 expected Resilience Score: $EXPECTED_RES_SCORE, Actual Resilience Score: $SCORE, Actual resilience score meets the expectations 🎉"
+              else
+                echo "❌ expected Resilience Score: $EXPECTED_RES_SCORE, Actual Resilience Score: $SCORE, Actual resilience score does NOT meet the expectations"
+                exit 1
+              fi
+            else
+              echo "📊 Resilience score: $SCORE"
+            fi
+          else
+            echo "⚠️  No resilience score available (phase: $PHASE)"
+          fi
+
+          echo "Resilience score: ${SCORE:-N/A}"

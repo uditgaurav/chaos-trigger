@@ -1,0 +1,209 @@
+name: Harness Chaos Trigger With APIs And Custom Inputs
+on:
+  # Allows you to run this workflow manually with custom runtime inputs
+  workflow_dispatch:
+    inputs:
+      pod_delete_target:
+        description: "pod-delete: TARGET_WORKLOAD_NAMES"
+        required: true
+        default: "frontend"
+      pod_delete_duration:
+        description: "pod-delete: TOTAL_CHAOS_DURATION (sec)"
+        required: true
+        default: "20"
+      pod_cpu_hog_target:
+        description: "pod-cpu-hog: TARGET_WORKLOAD_NAMES"
+        required: true
+        default: "cartservice"
+      pod_cpu_hog_duration:
+        description: "pod-cpu-hog: TOTAL_CHAOS_DURATION (sec)"
+        required: true
+        default: "30"
+      pod_cpu_hog_load:
+        description: "pod-cpu-hog: CPU_LOAD"
+        required: true
+        default: "100"
+      pod_network_latency_target:
+        description: "pod-network-latency: TARGET_WORKLOAD_NAMES"
+        required: true
+        default: "productcatalogservice"
+      pod_network_latency_duration:
+        description: "pod-network-latency: TOTAL_CHAOS_DURATION (sec)"
+        required: true
+        default: "30"
+      pod_network_latency_value:
+        description: "pod-network-latency: NETWORK_LATENCY"
+        required: true
+        default: "5000ms"
+      expected_resilience_score:
+        description: "Expected resilience score (0-100)"
+        required: true
+        default: "50"
+
+jobs:
+  harness-chaos:
+    runs-on: ubuntu-latest
+    env:
+      ACCOUNT_ID: ${{ vars.HARNESS_ACCOUNT_ID }}
+      ORG_ID: ${{ vars.HARNESS_ORG_ID }}
+      PROJECT_ID: ${{ vars.HARNESS_PROJECT_ID }}
+      EXPERIMENT_ID: ${{ vars.HARNESS_EXPERIMENT_ID }}
+      EXPECTED_RES_SCORE: ${{ inputs.expected_resilience_score }}
+      API_KEY: ${{ secrets.HARNESS_API_KEY }}
+      BASE_URL: https://app.harness.io
+      TIMEOUT: "300"
+      DELAY: "2"
+      POD_DELETE_TARGET: ${{ inputs.pod_delete_target }}
+      POD_DELETE_DURATION: ${{ inputs.pod_delete_duration }}
+      POD_CPU_HOG_TARGET: ${{ inputs.pod_cpu_hog_target }}
+      POD_CPU_HOG_DURATION: ${{ inputs.pod_cpu_hog_duration }}
+      POD_CPU_HOG_LOAD: ${{ inputs.pod_cpu_hog_load }}
+      POD_NET_LATENCY_TARGET: ${{ inputs.pod_network_latency_target }}
+      POD_NET_LATENCY_DURATION: ${{ inputs.pod_network_latency_duration }}
+      POD_NET_LATENCY_VALUE: ${{ inputs.pod_network_latency_value }}
+    steps:
+      - name: Trigger Harness Chaos Experiment and monitor
+        run: |
+          set -euo pipefail
+
+          API="$BASE_URL/gateway/chaos/manager/api/rest/v2/experiments/$EXPERIMENT_ID/run"
+          QS="accountIdentifier=$ACCOUNT_ID&organizationIdentifier=$ORG_ID&projectIdentifier=$PROJECT_ID"
+
+          PAYLOAD=$(jq -n \
+            --arg pod_delete_target "$POD_DELETE_TARGET" \
+            --argjson pod_delete_duration "$POD_DELETE_DURATION" \
+            --arg pod_cpu_hog_target "$POD_CPU_HOG_TARGET" \
+            --argjson pod_cpu_hog_duration "$POD_CPU_HOG_DURATION" \
+            --argjson pod_cpu_hog_load "$POD_CPU_HOG_LOAD" \
+            --arg pod_net_latency_target "$POD_NET_LATENCY_TARGET" \
+            --argjson pod_net_latency_duration "$POD_NET_LATENCY_DURATION" \
+            --arg pod_net_latency_value "$POD_NET_LATENCY_VALUE" \
+            '{
+              inputsetIdentity: "",
+              runtimeInputs: {
+                experiment: [],
+                tasks: {
+                  "app-health-check-6q9-o43": [
+                    { name: "URL", value: "http://frontend.boutique.svc.cluster.local" }
+                  ],
+                  "app-health-check-6q9-s1j": [
+                    { name: "URL", value: "http://frontend.boutique.svc.cluster.local" }
+                  ],
+                  "boutique-service-latency-check-joq-6jg": [
+                    { name: "CRITERIA", value: "<=" },
+                    { name: "VALUE", value: "300" }
+                  ],
+                  "container-restart-check-qf3-283": [],
+                  "container-restart-check-qf3-8u9": [],
+                  "container-restart-check-qf3-ywc": [],
+                  "grafana-chaos-annotation-g6w-cqp": [],
+                  "grafana-chaos-annotation-g6w-xqh": [],
+                  "load-trigger-qkl-051": [],
+                  "pod-cpu-hog-6zz": [
+                    { name: "TOTAL_CHAOS_DURATION", value: $pod_cpu_hog_duration },
+                    { name: "CPU_LOAD", value: $pod_cpu_hog_load },
+                    { name: "TARGET_WORKLOAD_NAMES", value: $pod_cpu_hog_target }
+                  ],
+                  "pod-delete-0ef": [
+                    { name: "TOTAL_CHAOS_DURATION", value: $pod_delete_duration },
+                    { name: "CHAOS_INTERVAL", value: $pod_delete_duration },
+                    { name: "TARGET_WORKLOAD_NAMES", value: $pod_delete_target }
+                  ],
+                  "pod-network-latency-0t7": [
+                    { name: "TOTAL_CHAOS_DURATION", value: $pod_net_latency_duration },
+                    { name: "NETWORK_LATENCY", value: $pod_net_latency_value },
+                    { name: "TARGET_WORKLOAD_NAMES", value: $pod_net_latency_target }
+                  ]
+                }
+              }
+            }')
+
+          RESP_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w "%{http_code}" \
+            -X POST "$API?$QS&isOnboardingRun=false&isIdentity=false" \
+            -H "x-api-key: $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" || echo "000")
+          RUN_RESP=$(cat "$RESP_FILE")
+          rm -f "$RESP_FILE"
+
+          if [ "$HTTP_CODE" != "200" ] || ! echo "$RUN_RESP" | jq -e . >/dev/null 2>&1; then
+            echo "❌ Failed to trigger experiment (HTTP $HTTP_CODE)."
+            echo "Response body:"
+            echo "$RUN_RESP"
+            exit 1
+          fi
+
+          NOTIFY_ID=$(echo "$RUN_RESP" | jq -r '.notifyId // .notifyID // empty')
+          if [ -z "$NOTIFY_ID" ]; then
+            echo "❌ No notifyId in response. Body:"
+            echo "$RUN_RESP"
+            exit 1
+          fi
+
+          echo "🚀 experiment ran successfully, notifyID: $NOTIFY_ID 🎉"
+          echo "The timeout: $TIMEOUT and delay: $DELAY"
+          echo
+
+          ELAPSED=0
+          PHASE=""
+          SCORE=""
+          while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+            POLL_FILE=$(mktemp)
+            POLL_CODE=$(curl -sS -o "$POLL_FILE" -w "%{http_code}" \
+              "$API?$QS&notifyId=$NOTIFY_ID" -H "x-api-key: $API_KEY" || echo "000")
+            RUN_GET=$(cat "$POLL_FILE")
+            rm -f "$POLL_FILE"
+
+            if [ "$POLL_CODE" != "200" ] || ! echo "$RUN_GET" | jq -e . >/dev/null 2>&1; then
+              echo "Waiting for experiment completion... transient poll error (HTTP $POLL_CODE)"
+              sleep "$DELAY"
+              ELAPSED=$((ELAPSED + DELAY))
+              continue
+            fi
+
+            PHASE=$(echo "$RUN_GET" | jq -r '.phase // empty')
+            SCORE=$(echo "$RUN_GET" | jq -r '.resiliencyScore // empty')
+
+            case "$PHASE" in
+              Completed|Completed_With_Error|Completed_With_Probe_Failure|Stopped|Error|Timeout)
+                echo "🚀 Experiment completed, CurrentState: $PHASE 🎉"
+                break
+                ;;
+              "")
+                echo "Waiting for experiment completion... CurrentState: Pending"
+                ;;
+              *)
+                echo "Waiting for experiment completion... CurrentState: $PHASE"
+                ;;
+            esac
+
+            sleep "$DELAY"
+            ELAPSED=$((ELAPSED + DELAY))
+          done
+
+          case "$PHASE" in
+            Completed|Completed_With_Error|Completed_With_Probe_Failure|Stopped|Error|Timeout) ;;
+            *)
+              echo "❌ Timed out after ${TIMEOUT}s waiting for experiment to complete (last state: ${PHASE:-Unknown})"
+              exit 1
+              ;;
+          esac
+
+          echo "The timeout: $TIMEOUT and delay: $DELAY"
+          if [ -n "$SCORE" ] && [ "$SCORE" != "null" ]; then
+            if [ -n "${EXPECTED_RES_SCORE:-}" ]; then
+              if awk -v a="$SCORE" -v b="$EXPECTED_RES_SCORE" 'BEGIN { exit !(a >= b) }'; then
+                echo "🚀 expected Resilience Score: $EXPECTED_RES_SCORE, Actual Resilience Score: $SCORE, Actual resilience score meets the expectations 🎉"
+              else
+                echo "❌ expected Resilience Score: $EXPECTED_RES_SCORE, Actual Resilience Score: $SCORE, Actual resilience score does NOT meet the expectations"
+                exit 1
+              fi
+            else
+              echo "📊 Resilience score: $SCORE"
+            fi
+          else
+            echo "⚠️  No resilience score available (phase: $PHASE)"
+          fi
+
+          echo "Resilience score: ${SCORE:-N/A}"

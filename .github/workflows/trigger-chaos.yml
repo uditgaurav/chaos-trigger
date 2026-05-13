@@ -1,0 +1,29 @@
+name: Harness Chaos
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  harness-chaos:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+    env:
+      ACCOUNT_ID: ${{ vars.HARNESS_ACCOUNT_ID }}
+      ORG_ID: ${{ vars.HARNESS_ORG_ID }}
+      PROJECT_ID: ${{ vars.HARNESS_PROJECT_ID }}
+      EXPERIMENT_ID: ${{ vars.HARNESS_EXPERIMENT_ID }}
+      EXPECTED_RES_SCORE: ${{ vars.HARNESS_EXPECTED_RES_SCORE }}
+      API_KEY: ${{ secrets.HARNESS_API_KEY }}
+    steps:
+      - name: Configure harness hce-cli
+        run: |
+          curl -sL https://app.harness.io/public/shared/tools/chaos/hce-cli/0.0.8/hce-cli-0.0.8-linux-amd64 -o hce-cli
+          chmod +x hce-cli
+          mv hce-cli /usr/local/bin/
+      - name: Trigger Harness Chaos Experiment and monitor
+        run: |
+          hce-cli config create --name "my-config-1" --interactive=false
+          hce-cli experiment run --account-id="$ACCOUNT_ID" --org-id="$ORG_ID" --project-id="$PROJECT_ID" --experiment-id="$EXPERIMENT_ID" --api-key="$API_KEY" --expected-res-score="$EXPECTED_RES_SCORE" --timeout 300  --interactive=false --monitor=true
